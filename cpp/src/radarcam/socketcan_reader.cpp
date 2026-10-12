@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 
 namespace bev {
@@ -18,10 +19,20 @@ SocketCanReader::SocketCanReader() = default;
 
 SocketCanReader::~SocketCanReader() { stop(); }
 
-bool SocketCanReader::start(const std::string& interface_name, std::string& error) {
+bool SocketCanReader::start(
+    const std::string& interface_name, std::string& error, RadarProtocol protocol, int drwig_radar_id) {
     if (running_.load()) {
         error = "SocketCanReader is already running.";
         return false;
+    }
+    // Fresh decode state per run, so switching protocol/radarId between runs can't mix old slots in.
+    protocol_ = protocol;
+    accumulator_ = RadarDwellAccumulator{};
+    drwig_decoder_ = DrwigLrrProDecoder(drwig_radar_id);
+    total_messages_ = 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        snapshot_ = DwellSnapshot{};
     }
 
     const int fd = socket(AF_CAN, SOCK_RAW, CAN_RAW);
@@ -88,6 +99,21 @@ void SocketCanReader::reader_loop(int fd) {
 
         ++total_messages_;
         const canid_t cid = frame.can_id & CAN_EFF_MASK;
+
+        if (protocol_ == RadarProtocol::kDrwigLrrPro) {
+            const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            const bool cycle_done = drwig_decoder_.handle_frame(cid, frame.data, frame.len, now_ms);
+
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (cycle_done) {
+                snapshot_.detections = drwig_decoder_.detections();
+                snapshot_.frame_id = drwig_decoder_.frame_id();
+            }
+            snapshot_.total_messages = total_messages_;
+            continue;
+        }
+
         const std::vector<uint8_t> data(frame.data, frame.data + frame.len);
 
         if (cid == 0x281) {

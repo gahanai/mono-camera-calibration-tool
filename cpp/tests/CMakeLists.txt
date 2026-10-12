@@ -15,6 +15,7 @@ add_executable(radarcam_tests
     test_refine_ceres.cpp
     test_validate.cpp
     test_diagnostics_render.cpp
+    test_drwig_planar.cpp
 )
 target_link_libraries(radarcam_tests PRIVATE bev_core bev_radarcam Catch2::Catch2WithMain)
 target_compile_definitions(radarcam_tests PRIVATE FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")

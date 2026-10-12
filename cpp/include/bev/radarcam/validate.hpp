@@ -217,9 +217,11 @@ struct DistributionDiagnostic {
     bool height_spread_flagged = false;  // "the one operators forget" -- explicit low-height-spread flag
 };
 
+// `planar`: a 2D radar's positions all have z=0 and its planar solve doesn't use height, so the SVD
+// degeneracy check runs on x/y only (flags near-collinear captures) and height is never flagged.
 inline DistributionDiagnostic compute_capture_distribution_diagnostic(
     const std::vector<cv::Point3d>& radar_positions, double svd_ratio_warn_threshold = 0.15,
-    double height_spread_min_m = 0.3) {
+    double height_spread_min_m = 0.3, bool planar = false) {
     DistributionDiagnostic diag;
     if (radar_positions.size() < 3) return diag;
 
@@ -227,16 +229,17 @@ inline DistributionDiagnostic compute_capture_distribution_diagnostic(
     for (const auto& p : radar_positions) centroid += p;
     centroid *= (1.0 / static_cast<double>(radar_positions.size()));
 
-    cv::Mat data(static_cast<int>(radar_positions.size()), 3, CV_64F);
+    const int dims = planar ? 2 : 3;
+    cv::Mat data(static_cast<int>(radar_positions.size()), dims, CV_64F);
     for (size_t i = 0; i < radar_positions.size(); ++i) {
         data.at<double>(static_cast<int>(i), 0) = radar_positions[i].x - centroid.x;
         data.at<double>(static_cast<int>(i), 1) = radar_positions[i].y - centroid.y;
-        data.at<double>(static_cast<int>(i), 2) = radar_positions[i].z - centroid.z;
+        if (!planar) data.at<double>(static_cast<int>(i), 2) = radar_positions[i].z - centroid.z;
     }
     cv::Mat U, S, Vt;
     cv::SVD::compute(data, S, U, Vt, cv::SVD::FULL_UV);
     const double largest = S.at<double>(0);
-    const double smallest = S.at<double>(2);
+    const double smallest = S.at<double>(dims - 1);
     diag.singular_value_ratio = (largest > 1e-12) ? (smallest / largest) : 0.0;
     diag.degenerate_warning = diag.singular_value_ratio < svd_ratio_warn_threshold;
 
@@ -256,7 +259,7 @@ inline DistributionDiagnostic compute_capture_distribution_diagnostic(
     diag.range_spread_m = max_range - min_range;
     diag.azimuth_spread_deg = max_az - min_az;
     diag.height_spread_m = max_z - min_z;
-    diag.height_spread_flagged = diag.height_spread_m < height_spread_min_m;
+    diag.height_spread_flagged = !planar && diag.height_spread_m < height_spread_min_m;
     diag.valid = true;
     return diag;
 }

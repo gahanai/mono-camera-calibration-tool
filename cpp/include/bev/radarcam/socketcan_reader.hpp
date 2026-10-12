@@ -11,6 +11,7 @@
 // thread. Implementation lives in socketcan_reader.cpp since it needs real socket syscalls.
 
 #include "bev/radarcam/can_decoder.hpp"
+#include "bev/radarcam/drwig_decoder.hpp"
 
 #include <atomic>
 #include <mutex>
@@ -20,6 +21,12 @@
 
 namespace bev {
 namespace radarcam {
+
+// Which radar's CAN protocol the reader decodes.
+enum class RadarProtocol {
+    kColumbusFc4d,  // CAN-FD raw detections, IDs 0x281-0x284 (can_decoder.hpp)
+    kDrwigLrrPro,   // classic CAN 2D tracked objects, one radarId's ID range (drwig_decoder.hpp)
+};
 
 struct DwellSnapshot {
     std::vector<RadarDetection> detections;
@@ -38,7 +45,10 @@ public:
 
     // Opens `interface_name` (e.g. "can1", "vcan0"), enables CAN-FD frame reception, and starts the
     // background reader thread. Returns false (with `error` populated) on any socket/bind failure.
-    bool start(const std::string& interface_name, std::string& error);
+    // `drwig_radar_id` (0..5) selects which radar on a shared bus to decode; only used for
+    // RadarProtocol::kDrwigLrrPro.
+    bool start(const std::string& interface_name, std::string& error,
+        RadarProtocol protocol = RadarProtocol::kColumbusFc4d, int drwig_radar_id = 0);
 
     // Stops the background thread and closes the socket. Safe to call multiple times; the
     // destructor also calls this.
@@ -58,7 +68,9 @@ private:
 
     mutable std::mutex mutex_;
     DwellSnapshot snapshot_;
+    RadarProtocol protocol_ = RadarProtocol::kColumbusFc4d;  // set in start(), before the thread runs
     RadarDwellAccumulator accumulator_;  // only touched by reader_loop -- no lock needed there
+    DrwigLrrProDecoder drwig_decoder_;   // likewise
     long total_messages_ = 0;
 };
 

@@ -363,19 +363,48 @@ private:
     }
 
     void load_config() {
+        // Load into a fresh struct: a key missing from this file must fall back to its default, not
+        // keep whatever the previously loaded config set (e.g. radar_type from a rear DRWIG config
+        // leaking into a front config that doesn't mention it).
+        bev::radarcam::RadarCamConfig loaded;
         std::string error;
-        if (!bev::radarcam::load_radarcam_config_yaml(config_path_->text().toStdString(), config_, error)) {
+        if (!bev::radarcam::load_radarcam_config_yaml(config_path_->text().toStdString(), loaded, error)) {
+            config_ = bev::radarcam::RadarCamConfig{};
             config_status_label_->setText(QString("Config: not loaded (%1) -- using struct defaults.")
                 .arg(QString::fromStdString(error)));
             apply_ui_state();
             return;
         }
-        config_status_label_->setText(QString("Config loaded: board %1x%2 @ %3m, %4 gate iteration(s).")
+        config_ = loaded;
+        if (!config_.can_interface.empty()) {
+            can_interface_->setText(QString::fromStdString(config_.can_interface));
+        }
+        const QString radar_desc = config_.is_drwig()
+            ? QString("DRWIG LRR Pro radarId %1, 2D planar solve").arg(config_.drwig_radar_id)
+            : QString("Columbus FC 4D, 6-DOF solve");
+        config_status_label_->setText(QString("Config loaded: %1; board %2x%3 @ %4m, %5 gate iteration(s).")
+            .arg(radar_desc)
             .arg(config_.board.inner_corners_x)
             .arg(config_.board.inner_corners_y)
             .arg(config_.board.square_size_m, 0, 'f', 3)
             .arg(static_cast<int>(config_.gate_radii_m.size())));
         apply_ui_state();
+    }
+
+    // Clutter-filter params shared by Inspect/Solve/Validate; callers set gate_radius_m themselves.
+    bev::radarcam::ClutterFilterParams clutter_params() const {
+        bev::radarcam::ClutterFilterParams params;
+        params.doppler_threshold_mps = config_.doppler_threshold_mps;
+        params.sigma_trihedral_dbsm = config_.sigma_trihedral_dbsm;
+        params.r_ref_m = config_.r_ref_m;
+        params.rcs_margin_db = config_.rcs_margin_db;
+        params.background_match_radius_m = config_.background_match_radius_m;
+        params.radar_height_above_ground_m = config_.radar_height_above_ground_m;
+        params.persistence_frac = config_.persistence_frac;
+        params.spread_max_m = config_.spread_max_m;
+        params.planar = config_.is_drwig();
+        params.has_rcs = !config_.is_drwig();
+        return params;
     }
 
     // Effective camera matrix for an already-rectified image, per the rectify-before-fusion
@@ -437,7 +466,9 @@ private:
 
     void start_radar_live() {
         std::string error;
-        if (!radar_reader_.start(can_interface_->text().toStdString(), error)) {
+        const auto protocol = config_.is_drwig() ? bev::radarcam::RadarProtocol::kDrwigLrrPro
+                                                 : bev::radarcam::RadarProtocol::kColumbusFc4d;
+        if (!radar_reader_.start(can_interface_->text().toStdString(), error, protocol, config_.drwig_radar_id)) {
             radar_status_label_->setText(QString("Radar: failed to start (%1)").arg(QString::fromStdString(error)));
             radar_live_toggle_->blockSignals(true);
             radar_live_toggle_->setChecked(false);
@@ -651,16 +682,8 @@ private:
         const cv::Matx33d R_coarse = radar_cam_tab_detail::euler_deg_to_rotation(config_.coarse_euler_deg);
         const cv::Vec3d& t_coarse = config_.coarse_translation_m;
 
-        bev::radarcam::ClutterFilterParams params;
+        bev::radarcam::ClutterFilterParams params = clutter_params();
         params.gate_radius_m = config_.gate_radii_m.empty() ? 2.0 : config_.gate_radii_m.front();
-        params.doppler_threshold_mps = config_.doppler_threshold_mps;
-        params.sigma_trihedral_dbsm = config_.sigma_trihedral_dbsm;
-        params.r_ref_m = config_.r_ref_m;
-        params.rcs_margin_db = config_.rcs_margin_db;
-        params.background_match_radius_m = config_.background_match_radius_m;
-        params.radar_height_above_ground_m = config_.radar_height_above_ground_m;
-        params.persistence_frac = config_.persistence_frac;
-        params.spread_max_m = config_.spread_max_m;
 
         std::vector<cv::Point3d> positions;
         for (const auto& lc : loaded) {
@@ -674,15 +697,18 @@ private:
             return;
         }
 
-        const auto diag = bev::radarcam::compute_capture_distribution_diagnostic(positions, config_.svd_ratio_warn_threshold);
+        const bool planar = config_.is_drwig();
+        const auto diag = bev::radarcam::compute_capture_distribution_diagnostic(
+            positions, config_.svd_ratio_warn_threshold, 0.3, planar);
         std::vector<bool> all_inliers(positions.size(), true);
         show_diagnostic_image(bev::radarcam::render_reflector_cloud(positions, all_inliers));
 
-        QString msg = QString("Inspect: %1 usable captures. Range spread %2m, azimuth spread %3deg, height spread %4m.")
+        QString msg = QString("Inspect: %1 usable captures. Range spread %2m, azimuth spread %3deg")
             .arg(static_cast<int>(positions.size()))
             .arg(diag.range_spread_m, 0, 'f', 2)
-            .arg(diag.azimuth_spread_deg, 0, 'f', 1)
-            .arg(diag.height_spread_m, 0, 'f', 2);
+            .arg(diag.azimuth_spread_deg, 0, 'f', 1);
+        msg += planar ? QString(" (2D radar: height not measured, not needed).")
+                      : QString(", height spread %1m.").arg(diag.height_spread_m, 0, 'f', 2);
         if (diag.degenerate_warning) {
             msg += QString(" WARNING: singular-value ratio %1 < %2 -- capture geometry may be near-degenerate.")
                 .arg(diag.singular_value_ratio, 0, 'f', 3).arg(config_.svd_ratio_warn_threshold, 0, 'f', 2);
@@ -729,18 +755,11 @@ private:
         }
 
         const cv::Matx33d R_coarse = radar_cam_tab_detail::euler_deg_to_rotation(config_.coarse_euler_deg);
-        bev::radarcam::ClutterFilterParams params;
-        params.doppler_threshold_mps = config_.doppler_threshold_mps;
-        params.sigma_trihedral_dbsm = config_.sigma_trihedral_dbsm;
-        params.r_ref_m = config_.r_ref_m;
-        params.rcs_margin_db = config_.rcs_margin_db;
-        params.background_match_radius_m = config_.background_match_radius_m;
-        params.radar_height_above_ground_m = config_.radar_height_above_ground_m;
-        params.persistence_frac = config_.persistence_frac;
-        params.spread_max_m = config_.spread_max_m;
+        const bool planar = config_.is_drwig();
 
         const auto iterate_result = bev::radarcam::run_gate_iterate(inputs, config_.gate_radii_m, R_coarse,
-            config_.coarse_translation_m, params, config_.ransac_inlier_threshold_m, config_.inlier_drop_warn_frac);
+            config_.coarse_translation_m, clutter_params(), config_.ransac_inlier_threshold_m,
+            config_.inlier_drop_warn_frac, planar);
         if (!iterate_result.success) {
             status_label_->setText("Solve failed: not enough inlier correspondences survived the gate-tightening loop.");
             show_diagnostic_image(bev::radarcam::render_inlier_vs_iteration(iterate_result.iterations));
@@ -758,7 +777,10 @@ private:
 
         bev::radarcam::RigidTransform final_transform = iterate_result.transform;
         cv::Vec3d x_b_estimated = config_.x_b_measured_m;
-        if (refine_inputs.size() >= 3) {
+        // Planar: the closed-form planar RANSAC refit is already the least-squares answer for the
+        // DOF a 2D radar observes. Ceres Mode A/B refine all 6 DOF (and Mode B the reflector offset),
+        // which would let pitch/roll/height drift on data that can't constrain them -- skip.
+        if (!planar && refine_inputs.size() >= 3) {
             if (config_.refine_mode == "B") {
                 const auto mode_b = bev::radarcam::refine_mode_b(
                     refine_inputs, iterate_result.transform, config_.x_b_measured_m, config_.huber_delta_m);
@@ -800,8 +822,9 @@ private:
         double sq_sum = 0.0, sq_sum_px = 0.0;
         const cv::Matx33d K = effective_camera_matrix();
         for (int idx : iterate_result.final_inlier_indices) {
-            const cv::Vec3d qv(iterate_result.per_capture[idx].q_radar.x, iterate_result.per_capture[idx].q_radar.y,
-                iterate_result.per_capture[idx].q_radar.z);
+            cv::Point3d q = iterate_result.per_capture[idx].q_radar;
+            if (planar) q = bev::radarcam::complete_planar_point(q, inputs[idx].p_camera, final_transform);
+            const cv::Vec3d qv(q.x, q.y, q.z);
             const cv::Vec3d predicted = final_transform.R * qv + final_transform.t;
             const cv::Point3d predicted_pt(predicted[0], predicted[1], predicted[2]);
             const double r = cv::norm(predicted_pt - inputs[idx].p_camera);
@@ -821,11 +844,17 @@ private:
 
         show_diagnostic_image(bev::radarcam::render_inlier_vs_iteration(iterate_result.iterations));
 
-        QString msg = QString("Solve: %1/%2 inliers, RMS %3 m, X_B drift %4 m.")
-            .arg(extrinsics.n_inliers)
-            .arg(extrinsics.n_total)
-            .arg(extrinsics.rms_residual_m, 0, 'f', 4)
-            .arg(extrinsics.x_b_drift_m, 0, 'f', 4);
+        QString msg = planar
+            ? QString("Solve (2D planar: yaw + in-plane offset; pitch/roll/height kept from config): %1/%2 inliers, "
+                      "in-plane RMS %3 m.")
+                  .arg(extrinsics.n_inliers)
+                  .arg(extrinsics.n_total)
+                  .arg(extrinsics.rms_residual_m, 0, 'f', 4)
+            : QString("Solve: %1/%2 inliers, RMS %3 m, X_B drift %4 m.")
+                  .arg(extrinsics.n_inliers)
+                  .arg(extrinsics.n_total)
+                  .arg(extrinsics.rms_residual_m, 0, 'f', 4)
+                  .arg(extrinsics.x_b_drift_m, 0, 'f', 4);
         for (const auto& rec : iterate_result.iterations) {
             if (rec.guardrail_triggered) {
                 msg += QString(" GUARDRAIL (iter %1): %2").arg(rec.iteration).arg(QString::fromStdString(rec.guardrail_message));
@@ -854,16 +883,8 @@ private:
         }
 
         const cv::Matx33d R_coarse = radar_cam_tab_detail::euler_deg_to_rotation(config_.coarse_euler_deg);
-        bev::radarcam::ClutterFilterParams params;
+        bev::radarcam::ClutterFilterParams params = clutter_params();
         params.gate_radius_m = config_.gate_radii_m.empty() ? 0.5 : config_.gate_radii_m.back();
-        params.doppler_threshold_mps = config_.doppler_threshold_mps;
-        params.sigma_trihedral_dbsm = config_.sigma_trihedral_dbsm;
-        params.r_ref_m = config_.r_ref_m;
-        params.rcs_margin_db = config_.rcs_margin_db;
-        params.background_match_radius_m = config_.background_match_radius_m;
-        params.radar_height_above_ground_m = config_.radar_height_above_ground_m;
-        params.persistence_frac = config_.persistence_frac;
-        params.spread_max_m = config_.spread_max_m;
 
         const int n_holdout = std::max(1, static_cast<int>(loaded.size() * config_.holdout_fraction));
         std::vector<bev::radarcam::HeldoutInput> heldout;
@@ -878,7 +899,11 @@ private:
             if (filtered.accepted) {
                 bev::radarcam::HeldoutInput hi;
                 hi.p_camera = lc.board.p_camera;
-                hi.q_radar = filtered.q_radar;
+                // Planar: fill in the height the 2D radar can't measure, so the residuals below (and
+                // the worst-residual overlay) report only the in-plane error the solve is accountable for.
+                hi.q_radar = config_.is_drwig()
+                    ? bev::radarcam::complete_planar_point(filtered.q_radar, lc.board.p_camera, last_solve_transform_)
+                    : filtered.q_radar;
                 heldout.push_back(hi);
                 heldout_loaded_indices.push_back(i);
             }
@@ -918,8 +943,9 @@ private:
                                .arg(worst_residual_m, 0, 'f', 3);
         }
 
-        QString msg = QString("Validate (n=%1): 3D RMS %2m median %3m p95 %4m | reprojection RMS %5px median %6px p95 %7px.")
+        QString msg = QString("Validate (n=%1): %2 RMS %3m median %4m p95 %5m | reprojection RMS %6px median %7px p95 %8px.")
             .arg(stats.n_holdout)
+            .arg(config_.is_drwig() ? "in-plane" : "3D")
             .arg(stats.rms_3d_m, 0, 'f', 4)
             .arg(stats.median_3d_m, 0, 'f', 4)
             .arg(stats.p95_3d_m, 0, 'f', 4)

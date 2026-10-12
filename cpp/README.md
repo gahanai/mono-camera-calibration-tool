@@ -84,6 +84,25 @@ systematic error the residuals otherwise can't detect), and two independent vali
   against the tape-measure/inclinometer values in the config). This is a read-only diagnostic:
   it never feeds back into the solve.
 
+### 2D radars (DRWIG LRR Pro)
+
+Set `radar_type: drwig_lrr_pro` in the config to calibrate a DRWIG LRR Pro instead of the default
+Columbus FC 4D (`radar_type: columbus_fc4d`). This radar is classic CAN and reports only 2D
+tracked objects (x/y position + velocity; no elevation, no RCS), so the tab switches to:
+
+- **Decode** (`include/bev/radarcam/drwig_decoder.hpp`): the 40 tracked-object slots of one radar,
+  selected by `drwig_radar_id` (0..5). Every CAN ID a radar sends is shifted by a fixed per-radarId
+  offset, so several radars can share one bus (e.g. rear-left = 4 → 0x550-0x5B0, rear-right = 5 →
+  0x730-0x790). Radar frame: x forward, **y to the radar's right** (the DBC's raw sign), z down —
+  write `coarse_euler_deg` for that frame. An optional `can_interface` key in the config sets the
+  CAN Interface field on load.
+- **Clutter filter**: gates in the radar plane (x/y only, since the reflector's height is lost),
+  skips the RCS gate, and picks the detection closest to the prediction instead of the brightest.
+- **Solve** (`include/bev/radarcam/planar_solve.hpp`): solves only yaw + in-plane offset — the DOF a
+  2D radar can observe — on top of the config's coarse extrinsic, whose pitch, roll and mounting
+  height are kept as measured. Ceres refinement is skipped (it would let those unobservable DOF
+  drift). Solve/Validate residuals are in-plane distances, and the reflector may be at any height.
+
 ### Testing without radar hardware
 
 The live CAN-FD reader can be exercised against a virtual CAN interface (`vcan0`), no radar

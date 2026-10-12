@@ -48,10 +48,21 @@ struct ClutterFilterParams {
     double radar_height_above_ground_m = 0.5;
     double persistence_frac = 0.8;
     double spread_max_m = 0.10;
+
+    // 2D radar (e.g. DRWIG LRR Pro, drwig_decoder.hpp): detections all lie in the radar's z=0 plane
+    // while q_hat keeps the reflector's true height, so every distance compares x/y only.
+    bool planar = false;
+    // false when the radar reports no RCS: stage 3 passes everything through, and stage 5 picks the
+    // detection closest to q_hat instead of the brightest (there is no brightness to rank by).
+    bool has_rcs = true;
 };
 
 namespace detail {
 inline double euclidean_distance(const cv::Point3d& a, const cv::Point3d& b) { return cv::norm(a - b); }
+
+inline double gate_distance(const cv::Point3d& a, const cv::Point3d& b, bool planar) {
+    return planar ? std::hypot(a.x - b.x, a.y - b.y) : euclidean_distance(a, b);
+}
 }  // namespace detail
 
 // q_hat = R_est^-1 * (p_camera - t_est): the reflector's expected radar-frame position given the
@@ -92,7 +103,8 @@ inline ClutterFilterResult run_clutter_pipeline(const RadarDwell& dwell, const R
                 ++entering;
                 bool matched = false;
                 for (const auto& bg_d : bg_pool) {
-                    if (detail::euclidean_distance(d.position, bg_d.position) <= params.background_match_radius_m) {
+                    if (detail::gate_distance(d.position, bg_d.position, params.planar) <=
+                        params.background_match_radius_m) {
                         matched = true;
                         break;
                     }
@@ -114,7 +126,7 @@ inline ClutterFilterResult run_clutter_pipeline(const RadarDwell& dwell, const R
         for (size_t fi = 0; fi < after_bg.size(); ++fi) {
             for (const auto& d : after_bg[fi]) {
                 ++entering;
-                if (detail::euclidean_distance(d.position, q_hat) <= params.gate_radius_m) {
+                if (detail::gate_distance(d.position, q_hat, params.planar) <= params.gate_radius_m) {
                     after_spatial[fi].push_back(d);
                     ++surviving;
                 }
@@ -152,7 +164,7 @@ inline ClutterFilterResult run_clutter_pipeline(const RadarDwell& dwell, const R
         for (size_t fi = 0; fi < after_doppler.size(); ++fi) {
             for (const auto& d : after_doppler[fi]) {
                 ++entering;
-                if (std::abs(d.rcs_dbsm - expected_dbsm) <= params.rcs_margin_db) {
+                if (!params.has_rcs || std::abs(d.rcs_dbsm - expected_dbsm) <= params.rcs_margin_db) {
                     after_rcs[fi].push_back(d);
                     ++surviving;
                 }
@@ -186,8 +198,13 @@ inline ClutterFilterResult run_clutter_pipeline(const RadarDwell& dwell, const R
         for (const auto& frame : after_ground) {
             entering += static_cast<int>(frame.size());
             if (frame.empty()) continue;
-            const auto best = std::max_element(frame.begin(), frame.end(),
-                [](const RadarDetection& a, const RadarDetection& b) { return a.rcs_dbsm < b.rcs_dbsm; });
+            const auto best = params.has_rcs
+                ? std::max_element(frame.begin(), frame.end(),
+                      [](const RadarDetection& a, const RadarDetection& b) { return a.rcs_dbsm < b.rcs_dbsm; })
+                : std::min_element(frame.begin(), frame.end(), [&](const RadarDetection& a, const RadarDetection& b) {
+                      return detail::gate_distance(a.position, q_hat, params.planar) <
+                             detail::gate_distance(b.position, q_hat, params.planar);
+                  });
             per_frame_best.push_back(*best);
             ++surviving;
         }
@@ -233,7 +250,7 @@ inline ClutterFilterResult run_clutter_pipeline(const RadarDwell& dwell, const R
 
         double max_spread = 0.0;
         for (const auto& d : per_frame_best) {
-            max_spread = std::max(max_spread, detail::euclidean_distance(d.position, median_pos));
+            max_spread = std::max(max_spread, detail::gate_distance(d.position, median_pos, params.planar));
         }
 
         if (!(max_spread < params.spread_max_m)) {

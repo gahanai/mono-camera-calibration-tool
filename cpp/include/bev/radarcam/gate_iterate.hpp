@@ -8,14 +8,14 @@
 // recorded on that iteration's record rather than silently trusting the tighter-but-smaller
 // consensus.
 //
-// §11 note: the solver interface here only supports the full 6-DOF solve. A future reduced-DOF
-// path (yaw+tx+ty only, for the 3D front radar) would slot in as an optional DOF mask threaded
-// through solve_kabsch/solve_ransac -- not implemented, since nothing in this spec's v1 scope needs
-// it yet.
+// §11 note: `planar` selects the reduced-DOF path (yaw + in-plane translation, planar_solve.hpp) for
+// a 2D radar; pitch/roll/height then stay fixed at coarse_R/coarse_t for every iteration. Callers
+// must also set params.planar so the clutter filter gates in the radar plane.
 
 #include "bev/radarcam/board_pnp.hpp"
 #include "bev/radarcam/clutter_filter.hpp"
 #include "bev/radarcam/kabsch.hpp"
+#include "bev/radarcam/planar_solve.hpp"
 #include "bev/radarcam/ransac.hpp"
 
 #include <opencv2/core.hpp>
@@ -59,7 +59,8 @@ struct GateIterateResult {
 // iteration's spatial gate. Other ClutterFilterParams fields are held fixed across iterations.
 inline GateIterateResult run_gate_iterate(const std::vector<CaptureInput>& captures,
     const std::vector<double>& gate_radii_m, const cv::Matx33d& coarse_R, const cv::Vec3d& coarse_t,
-    ClutterFilterParams params, double ransac_inlier_threshold_m, double inlier_drop_warn_frac) {
+    ClutterFilterParams params, double ransac_inlier_threshold_m, double inlier_drop_warn_frac,
+    bool planar = false) {
     GateIterateResult result;
     if (gate_radii_m.empty()) {
         return result;
@@ -99,7 +100,9 @@ inline GateIterateResult run_gate_iterate(const std::vector<CaptureInput>& captu
             return result;  // not enough correspondences to solve this iteration
         }
 
-        const auto ransac_result = solve_ransac(p_candidates, q_candidates, ransac_inlier_threshold_m);
+        const auto ransac_result = planar
+            ? solve_ransac_planar(p_candidates, q_candidates, coarse_R, coarse_t, ransac_inlier_threshold_m)
+            : solve_ransac(p_candidates, q_candidates, ransac_inlier_threshold_m);
         if (!ransac_result.success) {
             result.iterations.push_back(record);
             result.per_capture = per_capture;

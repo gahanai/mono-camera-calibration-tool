@@ -18,6 +18,16 @@ namespace bev {
 namespace radarcam {
 
 struct RadarCamConfig {
+    // Which radar this config calibrates. "columbus_fc4d" (default): CAN-FD 3D raw detections with RCS,
+    // full 6-DOF solve. "drwig_lrr_pro": classic CAN 2D tracked objects, no RCS/elevation -- the RCS
+    // gate is skipped and the solve is planar (yaw + in-plane offset only; pitch/roll/height stay at
+    // the coarse values below, see planar_solve.hpp).
+    std::string radar_type = "columbus_fc4d";
+    int drwig_radar_id = 0;     // radarId 0..5 selecting one radar on a shared bus (4 = rear-left, 5 = rear-right)
+    std::string can_interface;  // optional; when set, overrides the tab's CAN Interface field on load
+
+    bool is_drwig() const { return radar_type == "drwig_lrr_pro"; }
+
     // Target rig geometry (§2) -- reuses the same checkerboard params as intrinsics calibration.
     ChessboardConfig board;
     cv::Vec3d x_b_measured_m{0.0, 0.0, 0.0};  // reflector phase-center offset in board frame (calipers)
@@ -82,6 +92,18 @@ inline bool load_radarcam_config_yaml(const std::string& path, RadarCamConfig& o
             v = cv::Vec3d(root[key][0].as<double>(), root[key][1].as<double>(), root[key][2].as<double>());
         }
     };
+
+    read_string("radar_type", out.radar_type);
+    if (out.radar_type != "columbus_fc4d" && out.radar_type != "drwig_lrr_pro") {
+        error = "radar_type must be \"columbus_fc4d\" or \"drwig_lrr_pro\", got \"" + out.radar_type + "\".";
+        return false;
+    }
+    read_int("drwig_radar_id", out.drwig_radar_id);
+    if (out.drwig_radar_id < 0 || out.drwig_radar_id > 5) {
+        error = "drwig_radar_id must be 0..5, got " + std::to_string(out.drwig_radar_id) + ".";
+        return false;
+    }
+    read_string("can_interface", out.can_interface);
 
     if (root["board"]) {
         const auto& b = root["board"];
